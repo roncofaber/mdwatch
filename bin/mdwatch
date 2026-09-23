@@ -165,7 +165,7 @@ cmd_watch() {
     local last_poll_file="$MDWATCH_STATE_DIR/last_poll"
     local since="1970-01-01T00:00:00"
     [[ -f "$last_poll_file" ]] && since=$(cat "$last_poll_file")
-    date -u +"%FT%T" > "$last_poll_file"
+    date +"%FT%T" > "$last_poll_file"
     local dead_ids=""
     while IFS='|' read -r jobid state name elapsed nodelist exitcode; do
         [[ -z "${jobid:-}" ]] && continue
@@ -254,6 +254,7 @@ Description=mdwatch SLURM job watcher (one pass)
 
 [Service]
 Type=oneshot
+KillMode=process
 ExecStart=$bin_path watch
 EOF
     cat > "$unit_dir/mdwatch.timer" <<EOF

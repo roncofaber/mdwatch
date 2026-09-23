@@ -4,7 +4,7 @@
 # Enable by setting MDWATCH_NTFY_TOPIC in the config, or copy this hook into
 # ~/.config/mdwatch/hooks.d/ and edit the topic below.
 
-read -r -t 2 event || exit 0
+event=$(cat) || true
 topic="${MDWATCH_NTFY_TOPIC:-mdwatch-$(id -un)}"
 
 state=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$event" 2>/dev/null) || exit 0
