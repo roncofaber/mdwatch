@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 MDWATCH_STATE_DIR="${MDWATCH_STATE_DIR:-$HOME/.local/state/mdwatch}"
 MDWATCH_CONFIG="${MDWATCH_CONFIG:-$HOME/.config/mdwatch/config.env}"
@@ -112,8 +112,14 @@ run_hooks() {
 ntfy_push() {
     local event_file="$1"
     [[ -z "$MDWATCH_NTFY_TOPIC" ]] && return 0
-    local msg title
-    title="mdwatch: $(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(e["state"])' "$event_file" 2>/dev/null || echo event)"
+    local state title msg priority
+    state=$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(e.get("state","event"))' "$event_file" 2>/dev/null || echo event)
+    title="mdwatch: $state"
+    case "$state" in
+        FAILED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|CANCELLED) priority="high" ;;
+        STARTED) priority="min" ;;
+        *) priority="default" ;;
+    esac
     msg=$(python3 - "$event_file" <<'PY' 2>/dev/null || true
 import json, sys
 e = json.load(open(sys.argv[1]))
@@ -121,7 +127,7 @@ print(f"job {e['jobid']} ({e['name']}) on {e['cluster']}: {e['state']} after {e.
 PY
 )
     [[ -z "$msg" ]] && msg="$(basename "$event_file")"
-    curl -s -m 10 -H "Title: $title" -d "$msg" "$MDWATCH_NTFY_URL/$MDWATCH_NTFY_TOPIC" >/dev/null || true
+    curl -s -m 10 -H "Title: $title" -H "Priority: $priority" -d "$msg" "$MDWATCH_NTFY_URL/$MDWATCH_NTFY_TOPIC" >/dev/null || true
 }
 
 cmd_watch() {
@@ -300,8 +306,9 @@ EOF
         cat > "$MDWATCH_HOOKS_DIR/00-log-to-file.sh" <<'EOF'
 #!/usr/bin/env bash
 # example hook: append a one-line summary of every event
-read -r -t 2 event || exit 0
-echo "$(date -u +%FT%T) $event" >> "${MDWATCH_STATE_DIR:-$HOME/.local/state/mdwatch}/hooks.log"
+event=$(cat) || exit 0
+summary=$(printf '%s' "$event" | tr -d '\n' | tr -s ' ')
+echo "$(date -u +%FT%T) $summary" >> "${MDWATCH_STATE_DIR:-$HOME/.local/state/mdwatch}/hooks.log"
 EOF
         chmod +x "$MDWATCH_HOOKS_DIR/00-log-to-file.sh"
         echo "wrote $MDWATCH_HOOKS_DIR/00-log-to-file.sh"

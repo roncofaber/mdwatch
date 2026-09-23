@@ -3,14 +3,16 @@
 #
 # The agent investigates the failure autonomously (no human message needed).
 # Runs detached so the 30 s hook timeout does not apply; logs to
-# ~/.local/state/mdwatch/agent_logs/.
+# ~/.local/state/mdwatch/agent_logs/. The event JSON heads the log, and a
+# fallback DIAGNOSIS line is appended if the turn ends without printing one.
 #
 # Guards:
 # - reacts to FAILED/TIMEOUT/OUT_OF_MEMORY/NODE_FAIL only (extend the case to
 #   also react to FINISHED/CANCELLED)
 # - once per jobid (agent_handled marker prevents reaction loops)
-# - the prompt tells the agent to diagnose and NOT to resubmit blindly; paid
-#   partitions are never touched (cluster skill autonomy rules)
+# - --auto approves non-denied permissions so the headless turn is not killed
+#   by auto-rejections; the prompt rules (no resubmit, no paid partitions)
+#   keep it in bounds
 
 source "${MDWATCH_CONFIG:-$HOME/.config/mdwatch/config.env}" 2>/dev/null || true
 event=$(cat) || true
@@ -40,10 +42,14 @@ prompt="mdwatch event: SLURM job $jobid ('$name') ended with state $state. "
 prompt+="Investigate: find the job output/log if you can identify the project, "
 prompt+="diagnose the likely cause (input error, timeout, memory, node failure), "
 prompt+="and write a concise diagnosis. Do NOT resubmit anything and do NOT touch "
-prompt+="paid partitions. Some tool calls may be auto-rejected by permissions in "
-prompt+="headless mode: never retry a rejected call more than once, and ALWAYS end "
-prompt+="by printing a 'DIAGNOSIS:' line with whatever you found, even if partial."
+prompt+="paid partitions. Do NOT inspect mdwatch's own state or hooks directories "
+prompt+="(that wastes the turn). If a tool call is rejected by permissions, move on "
+prompt+="immediately. ALWAYS end by printing a 'DIAGNOSIS:' line with whatever you "
+prompt+="found, even if partial."
 
-setsid nohup timeout 900 bash -lc "$opencode_bin run \"$(printf '%s' "$prompt" | sed 's/"/\\"/g')\"" \
-    > "$logfile" 2>&1 < /dev/null &
+printf '%s\n' "$event" > "$logfile"
+setsid nohup bash -c '
+    timeout 900 "$1" run --auto "$2"
+    grep -aq "DIAGNOSIS:" "$3" || printf "DIAGNOSIS: no explicit diagnosis; the turn ended at a permission rejection or timeout, event JSON above.\n" >> "$3"
+' _ "$opencode_bin" "$prompt" "$logfile" >> "$logfile" 2>&1 < /dev/null &
 echo "$! > $logfile"
