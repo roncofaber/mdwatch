@@ -10,8 +10,9 @@
 #   mdwatch watch                 one poll pass (cron runs this)
 #   mdwatch events [N]            show the last N events
 #   mdwatch status                show watcher configuration
-#   mdwatch install               create dirs, config, hooks, cron entry
-#   mdwatch remove                remove the cron entry (state is kept)
+#   mdwatch install               create dirs, config, hooks, cron or systemd timer
+#   mdwatch daemon                foreground poll loop (last-resort scheduler)
+#   mdwatch remove                remove cron/timer (state is kept)
 #   mdwatch version
 
 set -euo pipefail
@@ -238,8 +239,47 @@ cmd_status() {
     if crontab -l 2>/dev/null | grep -q '# MDWATCH'; then
         echo "  cron:        installed"
     else
-        echo "  cron:        NOT installed (run: mdwatch install)"
+        echo "  scheduler:   $(active_mechanism) (install: mdwatch install)"
     fi
+}
+
+install_systemd_timer() {
+    local unit_dir="$HOME/.config/systemd/user"
+    local bin_path
+    bin_path=$(readlink -f "$0")
+    mkdir -p "$unit_dir"
+    cat > "$unit_dir/mdwatch.service" <<EOF
+[Unit]
+Description=mdwatch SLURM job watcher (one pass)
+
+[Service]
+Type=oneshot
+ExecStart=$bin_path watch
+EOF
+    cat > "$unit_dir/mdwatch.timer" <<EOF
+[Unit]
+Description=Run mdwatch every minute
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl --user daemon-reload 2>/dev/null || true
+    if systemctl --user enable --now mdwatch.timer 2>/dev/null; then
+        echo "systemd user timer installed (every 1 min, survives logout via linger)"
+        return 0
+    fi
+    echo "systemd user timer failed" >&2
+    return 1
+}
+
+active_mechanism() {
+    crontab -l 2>/dev/null | grep -q '# MDWATCH' && { echo "cron"; return 0; }
+    systemctl --user is-enabled mdwatch.timer >/dev/null 2>&1 && { echo "systemd-timer"; return 0; }
+    echo "none"
 }
 
 cmd_install() {
@@ -269,15 +309,34 @@ EOF
     cron_line="* * * * * $(readlink -f "$0") watch # MDWATCH"
     if crontab -l 2>/dev/null | grep -q '# MDWATCH'; then
         echo "cron already installed"
-    else
-        (crontab -l 2>/dev/null; echo "$cron_line") | crontab -
+        return 0
+    fi
+    if (crontab -l 2>/dev/null; echo "$cron_line") | crontab - 2>/dev/null; then
         echo "cron installed (every 1 min)"
+    else
+        echo "crontab not permitted on this node; falling back to a systemd user timer"
+        install_systemd_timer || {
+            echo "no scheduler available; run 'setsid nohup $(readlink -f "$0") daemon >/dev/null 2>&1 &' as a last resort" >&2
+            return 1
+        }
     fi
 }
 
+cmd_daemon() {
+    load_config
+    local interval="${MDWATCH_INTERVAL:-60}"
+    while true; do
+        "$0" watch >/dev/null 2>&1 || true
+        sleep "$interval"
+    done
+}
+
 cmd_remove() {
-    crontab -l 2>/dev/null | grep -v '# MDWATCH' | crontab - || true
-    echo "cron removed (state and events kept)"
+    crontab -l 2>/dev/null | grep -v '# MDWATCH' | crontab - 2>/dev/null || true
+    systemctl --user disable --now mdwatch.timer 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/mdwatch.service" "$HOME/.config/systemd/user/mdwatch.timer"
+    systemctl --user daemon-reload 2>/dev/null || true
+    echo "schedulers removed (state and events kept)"
 }
 
 case "${1:-}" in
@@ -285,6 +344,7 @@ case "${1:-}" in
     events)  shift; cmd_events "$@" ;;
     status)  shift; cmd_status "$@" ;;
     install) shift; cmd_install "$@" ;;
+    daemon)  shift; cmd_daemon "$@" ;;
     remove)  shift; cmd_remove "$@" ;;
     version) echo "mdwatch $VERSION" ;;
     -h|--help|help|"") usage ;;
