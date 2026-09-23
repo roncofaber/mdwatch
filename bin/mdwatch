@@ -266,12 +266,12 @@ EOF
         echo "wrote $MDWATCH_HOOKS_DIR/00-log-to-file.sh"
     fi
     local cron_line
-    cron_line="*/5 * * * * $(readlink -f "$0") watch # MDWATCH"
+    cron_line="* * * * * $(readlink -f "$0") watch # MDWATCH"
     if crontab -l 2>/dev/null | grep -q '# MDWATCH'; then
         echo "cron already installed"
     else
         (crontab -l 2>/dev/null; echo "$cron_line") | crontab -
-        echo "cron installed (every 5 min)"
+        echo "cron installed (every 1 min)"
     fi
 }
 

@@ -20,14 +20,14 @@ bin/mdwatch status
 
 `install` creates `~/.local/state/mdwatch/` (state + events), `~/.config/mdwatch/`
 (config + hooks), writes a commented default config if missing, and adds a
-5-minute cron entry marked `# MDWATCH`. `mdwatch remove` takes the cron entry
+1-minute cron entry marked `# MDWATCH`. `mdwatch remove` takes the cron entry
 out again (state and events are kept).
 
 ## Commands
 
 | Command | Purpose |
 |---|---|
-| `mdwatch watch` | one poll pass (cron runs this every 5 min) |
+| `mdwatch watch` | one poll pass (cron runs this every 1 min) |
 | `mdwatch events [N]` | show the last N events |
 | `mdwatch status` | configuration and watcher state |
 | `mdwatch install` / `mdwatch remove` | manage the cron entry |
