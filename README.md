@@ -1,117 +1,127 @@
 # mdwatch
 
-SLURM job event watcher with a local hook system. Polls the queue for a user's
-jobs, diffs against the last known state, and on every state transition writes
-an event JSON file and runs the hook scripts in `hooks.d/` with the event on
-stdin. Optional ntfy.sh push built in. Runs every minute from cron, or from a
-systemd user timer where crontab is not permitted: set up once, then chill.
+Job event watcher for SLURM. It polls your jobs once a minute, writes one JSON file per state change, runs your hook scripts on each event, and can push notifications to your phone through [ntfy](https://ntfy.sh). It works for any kind of job, needs no root access and no daemon, and depends only on bash, the SLURM client tools, python3 and coreutils.
 
-No sleep-polling loops in agent sessions or terminal tabs: `mdwatch events`
-answers "what happened" in one instant call, and hooks fire within the cron
-interval without anyone watching.
+Agents and scripts can ask "what happened?" (`mdwatch events`) or block until a job ends (`mdwatch wait`) instead of polling `squeue` in a loop.
 
 ## Install
 
 ```bash
-git clone git@github.com:roncofaber/mdwatch.git
-cd mdwatch
-bin/mdwatch install
-bin/mdwatch status
+git clone https://github.com/roncofaber/mdwatch.git
+mdwatch/bin/mdwatch install
+mdwatch status
 ```
 
-`install` creates `~/.local/state/mdwatch/` (state + events), `~/.config/mdwatch/`
-(config + hooks), writes a commented default config if missing, links
-`~/.local/bin/mdwatch`, and adds a 1-minute cron entry marked `# MDWATCH`. When
-crontab is not permitted it installs a systemd user timer instead (enable
-linger with `loginctl enable-linger` so it survives logout). `mdwatch remove`
-takes the scheduler out again (state and events are kept).
+`install` creates the config and state directories, links `~/.local/bin/mdwatch`, and schedules `mdwatch watch` every minute: a cron entry, or a systemd user timer where crontab is not allowed. For the timer to keep running after you log out, the cluster must allow `loginctl enable-linger $USER`. `mdwatch remove` unschedules it and keeps your events.
 
 ## Commands
 
 | Command | Purpose |
 |---|---|
-| `mdwatch watch` | one poll pass (cron runs this every 1 min) |
-| `mdwatch events [N]` | show the last N events |
-| `mdwatch show JOBID [LINES]` | event JSON, workdir and tails of the job's stdout/stderr |
-| `mdwatch status` | configuration and watcher state |
-| `mdwatch install` / `mdwatch remove` | manage the cron entry or systemd timer |
-| `mdwatch version` | version |
+| `mdwatch events [N]` | last N events, one line each |
+| `mdwatch show JOBID [LINES]` | the job's latest event, workdir, and the tail of its stdout/stderr |
+| `mdwatch wait JOBID... [--timeout S]` | block until the jobs end; exit 0 if all finished, 1 otherwise, 124 on timeout |
+| `mdwatch status` | configuration and scheduler state |
+| `mdwatch watch` | one poll pass (the scheduler runs this) |
+| `mdwatch install` / `remove` | schedule or unschedule the watcher |
 
 ## Events
 
-Every transition produces a JSON file in `~/.local/state/mdwatch/events/`:
+| Event | When |
+|---|---|
+| `SUBMITTED` | job first seen pending |
+| `STARTED` | job begins running |
+| `REQUEUED` | running job went back to pending |
+| `NEAR_TIMEOUT` | elapsed time passed `MDWATCH_WALLTIME_WARN` percent of the limit (default 90) |
+| `STALLED` | running job produced no output for the stall window (opt-in, see below) |
+| `FINISHED`, `FAILED`, `TIMEOUT`, `CANCELLED`, `OUT_OF_MEMORY`, `NODE_FAIL`, `PREEMPTED`, `BOOT_FAIL`, `DEADLINE` | terminal state from accounting |
+
+Array tasks are tracked individually (`1234_7`). Jobs that start and end between two polls are still caught from accounting. Events live in `~/.local/state/mdwatch/events/`; a terminal event looks like:
 
 ```json
 {
   "timestamp": "2026-09-23T12:36:37Z",
-  "cluster": "etna",
-  "jobid": "26292466",
-  "name": "nacl_chain_1pair",
+  "cluster": "local",
+  "user": "alice",
+  "jobid": "1234567",
+  "name": "relax_run",
   "state": "FINISHED",
   "exitcode": "0:0",
-  "node": "n0046.etna0",
+  "node": "node042",
   "elapsed": "08:12:44",
-  "workdir": "/global/scratch/users/roncoroni/run",
-  "stdout": "/global/scratch/users/roncoroni/run/slurm-nacl_chain_1pair-26292466.out",
-  "stderr": ""
+  "timelimit": "12:00:00",
+  "time_used": "68%",
+  "cpus": "24",
+  "cpu_efficiency": "91%",
+  "max_rss": "2.2G",
+  "req_mem": "60G",
+  "workdir": "/scratch/alice/relax",
+  "stdout": "/scratch/alice/relax/slurm-1234567.out",
+  "stderr": "/scratch/alice/relax/slurm-1234567.out"
 }
 ```
 
-States: `STARTED`, `FINISHED`, `FAILED`, `TIMEOUT`, `CANCELLED`,
-`OUT_OF_MEMORY`, `NODE_FAIL`, `PREEMPTED`, `BOOT_FAIL`, `DEADLINE`.
+Empty fields are omitted. `time_used`, `cpu_efficiency` and `max_rss` help you size future `--time` and `--mem` requests.
+
+## Per-job options
+
+Put options in the job comment; mdwatch reads the `mdwatch:` token and ignores the rest:
+
+```bash
+sbatch --comment=mdwatch:stall=30,notify=high job.sh
+```
+
+| Option | Effect |
+|---|---|
+| `off` | ignore this job entirely |
+| `stall=MIN` | emit `STALLED` if no file under the workdir or the job's stdout/stderr changed for MIN minutes |
+| `watch=PATH` | also count changes under PATH as activity |
+| `notify=off` / `notify=high` | suppress, or always send at high priority |
+| any `key=value` | passed to hooks in the event's `tags` field (e.g. `agent=off`) |
+
+Set `MDWATCH_STALL_MINUTES` to apply a stall window to every job.
 
 ## Hooks
 
-Every executable in `~/.config/mdwatch/hooks.d/` runs on every event, with the
-event JSON on stdin and a 30 s timeout. Example: push failures to your phone
-via ntfy:
+Every executable in `~/.config/mdwatch/hooks.d/` runs on each event with the event JSON on stdin and its path in `MDWATCH_EVENT_FILE`. Hooks run detached with a timeout (`MDWATCH_HOOK_TIMEOUT`, default 30 s), so a slow hook never delays the poll. To receive only some states, add a line near the top of the hook:
 
 ```bash
-cp examples/ntfy.sh ~/.config/mdwatch/hooks.d/10-ntfy.sh
-chmod +x ~/.config/mdwatch/hooks.d/10-ntfy.sh
+# mdwatch-states: FAILED TIMEOUT OUT_OF_MEMORY
 ```
 
-Hooks are the webhook equivalent on a cluster login node: anything that can
-read stdin can react - a notification, a slack/teams relay, or a headless
-`opencode run "<event context>"` agent turn.
+Examples in `examples/`:
 
-### Headless agent diagnosis
-
-`examples/opencode-agent.sh` starts a detached `opencode run` on FAILED,
-TIMEOUT, OUT_OF_MEMORY and NODE_FAIL events, once per job. It runs in the
-job's workdir as a read-only agent (reads anywhere, only inspection commands
-such as `cat`, `tail`, `sacct`, `mdwatch show`; no edits, submits or cancels),
-logs to `~/.local/state/mdwatch/agent_logs/`, and pushes its final
-`DIAGNOSIS:` line to ntfy when a topic is set.
-
-```bash
-cp examples/opencode-agent.sh ~/.config/mdwatch/hooks.d/20-opencode-agent.sh
-chmod +x ~/.config/mdwatch/hooks.d/20-opencode-agent.sh
-```
-
-Timers and cron do not load your shell profile, so the hook sources
-`MDWATCH_AGENT_ENV` (default `~/.secrets.env`) for the provider API key.
-Select the model with `MDWATCH_AGENT_MODEL` (default
-`cborg/lbl/cborg-coder-max`, which must exist in your opencode config) and the
-states with `MDWATCH_AGENT_STATES`.
+- `log-to-file.sh`: one line per event in `hooks.log` (installed by default).
+- `ntfy.sh`: standalone ntfy push, if you want different formatting from the built-in one.
+- `opencode-agent.sh`: starts a headless [opencode](https://opencode.ai) agent that diagnoses failed or stalled jobs. It runs read-only in the job's workdir (it can read files and run `sacct`, `squeue` and `mdwatch show`, but cannot edit, submit or cancel), writes its log to `~/.local/state/mdwatch/agent_logs/`, and pushes its final `DIAGNOSIS:` line to ntfy. Timers and cron do not load your shell profile, so it sources `MDWATCH_AGENT_ENV` (default `~/.secrets.env`) for API keys; set the model with `MDWATCH_AGENT_MODEL`.
 
 ## Configuration
 
-`~/.config/mdwatch/config.env`:
+`~/.config/mdwatch/config.env`; every setting is optional:
 
 ```bash
-MDWATCH_USER=roncoroni
-MDWATCH_CLUSTERS=              # e.g. "etna" for squeue -M; empty = local cluster
-MDWATCH_NTFY_TOPIC=            # enables the built-in ntfy push
+MDWATCH_CLUSTERS=           # squeue/sacct -M value; empty = local cluster
+MDWATCH_NTFY_TOPIC=         # enables pushes; choose an unguessable topic name
 MDWATCH_NTFY_URL=https://ntfy.sh
-MDWATCH_AGENT_MODEL=           # opencode provider/model for the agent hook
-MDWATCH_AGENT_ENV=             # file with API keys, default ~/.secrets.env
-MDWATCH_AGENT_STATES=          # default "FAILED TIMEOUT OUT_OF_MEMORY NODE_FAIL"
+MDWATCH_NTFY_STATES="STARTED REQUEUED NEAR_TIMEOUT STALLED FINISHED FAILED TIMEOUT ..."
+MDWATCH_WALLTIME_WARN=90    # percent of the time limit for NEAR_TIMEOUT
+MDWATCH_STALL_MINUTES=0     # default stall window; 0 = only jobs tagged stall=N
+MDWATCH_KEEP_HOURS=48       # forget finished jobs after this long
+MDWATCH_EVENT_DAYS=60       # delete older event files
 ```
 
-## Use with agents
+Notifications from one poll are batched into a single push.
 
-The `lbl-hpc-cluster` skill references this tool: agents call `mdwatch events`
-instead of sleep-polling `squeue`, and can drop a hook into `hooks.d/` to
-trigger reactions autonomously. Event JSON is the interface - one schema for
-simulations finishing, failing, timing out, or anything else SLURM reports.
+## Site notes: LBL Lawrencium (LRC)
+
+These notes apply only to the Lawrencium cluster at Berkeley Lab; the tool itself is site-independent.
+
+- `crontab` and `scrontab` are disabled for regular users, so `install` falls back to the systemd user timer. Linger is enabled for users, so the timer survives logout.
+- `/usr/bin/python3` is Python 3.6, which is enough for mdwatch.
+- For the agent hook, LBL's CBorg gateway serves free models; configure a CBorg provider in opencode and set `MDWATCH_AGENT_MODEL` to it (for example `cborg/lbl/cborg-coder-max`).
+
+## Development
+
+```bash
+tests/run.sh    # scenario tests against fake squeue/sacct/scontrol
+```

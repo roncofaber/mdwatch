@@ -1,29 +1,40 @@
 #!/usr/bin/env bash
 # mdwatch - SLURM job event watcher with a local hook system.
 #
-# Polls the queue for a user's jobs, diffs against the last known state, and on
-# every state transition (STARTED, FINISHED, FAILED, TIMEOUT, CANCELLED, ...)
-# writes an event JSON file and runs the hook scripts in hooks.d with the event
-# on stdin. An optional ntfy.sh push is built in.
+# Watches all of a user's SLURM jobs, diffs the queue against the last known
+# state, and on every transition writes an event JSON file, runs the hooks in
+# hooks.d with the event on stdin, and optionally pushes a notification via ntfy.
 #
 # Usage:
-#   mdwatch watch                 one poll pass (cron or the systemd timer runs this)
-#   mdwatch events [N]            show the last N events
-#   mdwatch show JOBID [LINES]    event JSON, workdir and tails of the job's stdout/stderr
-#   mdwatch status                show watcher configuration
-#   mdwatch install               create dirs, config, hooks, cron or systemd timer
-#   mdwatch daemon                foreground poll loop (last-resort scheduler)
-#   mdwatch remove                remove cron/timer (state is kept)
+#   mdwatch watch                       one poll pass (cron or the systemd timer runs this)
+#   mdwatch events [N]                  show the last N events
+#   mdwatch show JOBID [LINES]          event JSON, workdir and tails of the job's stdout/stderr
+#   mdwatch wait JOBID... [--timeout S] block until the jobs end; exit 0 if all FINISHED,
+#                                       1 if any ended otherwise, 124 on timeout
+#   mdwatch status                      show watcher configuration
+#   mdwatch install                     create dirs, config, hooks, cron or systemd timer
+#   mdwatch daemon                      foreground poll loop (last-resort scheduler)
+#   mdwatch remove                      remove cron/timer (state is kept)
 #   mdwatch version
+#
+# Events: SUBMITTED STARTED REQUEUED NEAR_TIMEOUT STALLED, then one terminal state:
+# FINISHED FAILED TIMEOUT CANCELLED OUT_OF_MEMORY NODE_FAIL PREEMPTED BOOT_FAIL DEADLINE.
+#
+# Per-job options go in the job comment: sbatch --comment=mdwatch:stall=30,notify=high
+#   off           ignore the job entirely         notify=off|high  ntfy policy
+#   stall=MIN     STALLED when no output for MIN  watch=PATH       extra path to check for activity
+#   any other key=value is passed to hooks in the "tags" field (e.g. agent=off)
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 MDWATCH_STATE_DIR="${MDWATCH_STATE_DIR:-$HOME/.local/state/mdwatch}"
 MDWATCH_CONFIG="${MDWATCH_CONFIG:-$HOME/.config/mdwatch/config.env}"
 MDWATCH_HOOKS_DIR="${MDWATCH_HOOKS_DIR:-$HOME/.config/mdwatch/hooks.d}"
 MDWATCH_HOOK_TIMEOUT="${MDWATCH_HOOK_TIMEOUT:-30}"
+TERMINAL_EVENTS="FINISHED FAILED TIMEOUT CANCELLED OUT_OF_MEMORY OUT_OF_TIME NODE_FAIL PREEMPTED BOOT_FAIL DEADLINE"
+NOTIFY=()
 
 usage() {
     awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
@@ -38,204 +49,371 @@ load_config() {
     MDWATCH_CLUSTERS="${MDWATCH_CLUSTERS:-}"
     MDWATCH_NTFY_TOPIC="${MDWATCH_NTFY_TOPIC:-}"
     MDWATCH_NTFY_URL="${MDWATCH_NTFY_URL:-https://ntfy.sh}"
+    MDWATCH_NTFY_STATES="${MDWATCH_NTFY_STATES:-STARTED REQUEUED NEAR_TIMEOUT STALLED $TERMINAL_EVENTS}"
+    MDWATCH_WALLTIME_WARN="${MDWATCH_WALLTIME_WARN:-90}"
+    MDWATCH_STALL_MINUTES="${MDWATCH_STALL_MINUTES:-0}"
+    MDWATCH_STALL_DEPTH="${MDWATCH_STALL_DEPTH:-4}"
+    MDWATCH_KEEP_HOURS="${MDWATCH_KEEP_HOURS:-48}"
+    MDWATCH_EVENT_DAYS="${MDWATCH_EVENT_DAYS:-60}"
+}
+
+cluster_args() {
+    [[ -n "$MDWATCH_CLUSTERS" ]] && printf '%s\n' -M "$MDWATCH_CLUSTERS"
+    return 0
 }
 
 now_iso() {
     date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
-queue_snapshot() {
-    local args=(-u "$MDWATCH_USER" -h -o '%i|%T|%j|%N|%M')
-    [[ -n "$MDWATCH_CLUSTERS" ]] && args=(-M "$MDWATCH_CLUSTERS" "${args[@]}")
-    squeue "${args[@]}" 2>/dev/null || true
-}
-
-# final state for job ids that left the queue; prints "jobid|state|name|elapsed|nodelist|exitcode|workdir|stdout|stderr"
-final_states() {
-    local ids="$1"
-    [[ -z "$ids" ]] && return 0
-    local args=(-X --parsable2 --expand-patterns -j "$ids" -o 'JobID,State,JobName,Elapsed,NodeList,ExitCode,WorkDir,StdOut,StdErr')
-    [[ -n "$MDWATCH_CLUSTERS" ]] && args=(-M "$MDWATCH_CLUSTERS" "${args[@]}")
-    sacct "${args[@]}" 2>/dev/null || true
+# SLURM durations ([D-]HH:MM:SS, MM:SS, MM:SS.mmm) to seconds; anything else is 0
+to_seconds() {
+    local t="$1" d=0 h=0 m=0 s=0
+    [[ "$t" =~ ^[0-9] ]] || { echo 0; return; }
+    if [[ "$t" == *-* ]]; then d=${t%%-*}; t=${t#*-}; fi
+    t=${t%%.*}
+    local p
+    IFS=: read -r -a p <<< "$t"
+    case ${#p[@]} in
+        3) h=${p[0]}; m=${p[1]}; s=${p[2]} ;;
+        2) m=${p[0]}; s=${p[1]} ;;
+        1) m=${p[0]} ;;
+    esac
+    echo $(( 10#$d * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$s ))
 }
 
 canonical_state() {
     case "$1" in
         COMPLETED)          echo "FINISHED" ;;
-        FAILED)             echo "FAILED" ;;
-        TIMEOUT)            echo "TIMEOUT" ;;
         CANCELLED*|REVOKED) echo "CANCELLED" ;;
-        OUT_OF_MEMORY)      echo "OUT_OF_MEMORY" ;;
-        OUT_OF_TIME)        echo "OUT_OF_TIME" ;;
-        NODE_FAIL)          echo "NODE_FAIL" ;;
-        PREEMPTED)          echo "PREEMPTED" ;;
-        BOOT_FAIL)          echo "BOOT_FAIL" ;;
-        DEADLINE)           echo "DEADLINE" ;;
         *)                  echo "$1" ;;
     esac
 }
 
 is_running_state() {
     case "$1" in
-        PENDING|CONFIGURING|COMPLETING|RUNNING|SUSPENDED|RESIZING) return 0 ;;
+        PENDING|CONFIGURING|COMPLETING|RUNNING|SUSPENDED|RESIZING|REQUEUED|STAGE_OUT|SIGNALING) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+is_terminal_event() {
+    [[ " $TERMINAL_EVENTS " == *" $1 "* ]]
 }
 
 json_escape() {
     local s="${1//\\/\\\\}"
     s="${s//\"/\\\"}"
-    printf '%s' "$s"
+    s="${s//$'\t'/ }"
+    printf '%s' "${s//$'\n'/ }"
 }
 
+# "... mdwatch:stall=30,notify=high ..." -> "stall=30 notify=high"
+job_tags() {
+    [[ "$1" =~ mdwatch:([^[:space:]]*) ]] && printf '%s' "${BASH_REMATCH[1]//,/ }"
+    return 0
+}
+
+tag_value() {
+    local t list
+    read -r -a list <<< "$1"
+    for t in ${list[@]+"${list[@]}"}; do
+        [[ "$t" == "$2="* ]] && { printf '%s' "${t#*=}"; return 0; }
+    done
+    return 0
+}
+
+tag_set() {
+    local t list
+    read -r -a list <<< "$1"
+    for t in ${list[@]+"${list[@]}"}; do
+        [[ "$t" == "$2" ]] && return 0
+    done
+    return 1
+}
+
+# emit_event JOBID NAME STATE KEY VALUE [KEY VALUE ...]; prints the event file path
 emit_event() {
-    local cluster="$1" jobid="$2" name="$3" state="$4" extra="$5"
-    local ts
+    local jobid="$1" name="$2" state="$3"
+    shift 3
+    local ts file
     ts="$(now_iso)"
-    local file="$MDWATCH_STATE_DIR/events/${ts//:/}${jobid}_${state}.json"
+    file="$MDWATCH_STATE_DIR/events/${ts//:/}_${jobid}_${state}.json"
     {
-        printf '{\n'
-        printf '  "timestamp": "%s",\n' "$ts"
-        printf '  "cluster": "%s",\n' "$cluster"
-        printf '  "jobid": "%s",\n' "$jobid"
-        printf '  "name": "%s",\n' "$(json_escape "$name")"
-        printf '  "state": "%s",\n' "$state"
-        printf '%b' "$extra"
-        printf '}\n'
-    } > "$file"
+        printf '{\n  "timestamp": "%s",\n  "cluster": "%s",\n  "user": "%s",\n' "$ts" "${MDWATCH_CLUSTERS:-local}" "$MDWATCH_USER"
+        printf '  "jobid": "%s",\n  "name": "%s",\n  "state": "%s"' "$jobid" "$(json_escape "$name")" "$state"
+        while (( $# >= 2 )); do
+            [[ -n "$2" ]] && printf ',\n  "%s": "%s"' "$1" "$(json_escape "$2")"
+            shift 2
+        done
+        printf '\n}\n'
+    } > "$file.tmp"
+    mv "$file.tmp" "$file"
     printf '%s\n' "$file"
 }
 
+# hooks run detached so a slow hook never delays the poll; a hook limits the states it
+# receives with a "# mdwatch-states: FAILED TIMEOUT" line in its first 20 lines
 run_hooks() {
-    local event_file="$1"
+    local event_file="$1" state="$2" hook wanted
     [[ -d "$MDWATCH_HOOKS_DIR" ]] || return 0
-    local hook
     for hook in "$MDWATCH_HOOKS_DIR"/*; do
-        [[ -x "$hook" ]] || continue
-        timeout "$MDWATCH_HOOK_TIMEOUT" "$hook" < "$event_file" >/dev/null 2>&1 || true
+        [[ -f "$hook" && -x "$hook" ]] || continue
+        wanted=$(head -n 20 "$hook" | sed -n 's/^# *mdwatch-states: *//p' | head -n 1)
+        [[ -z "$wanted" || " $wanted " == *" $state "* ]] || continue
+        MDWATCH_EVENT_FILE="$event_file" setsid timeout "$MDWATCH_HOOK_TIMEOUT" "$hook" \
+            < "$event_file" >/dev/null 2>&1 9>&- &
     done
+    return 0
 }
 
-ntfy_push() {
-    local event_file="$1"
-    [[ -z "$MDWATCH_NTFY_TOPIC" ]] && return 0
-    local state title msg priority
-    state=$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(e.get("state","event"))' "$event_file" 2>/dev/null || echo event)
-    title="mdwatch: $state"
+queue_notify() {
+    local jobid="$1" name="$2" state="$3" detail="$4" tags="$5"
+    [[ -n "$MDWATCH_NTFY_TOPIC" ]] || return 0
+    local policy
+    policy=$(tag_value "$tags" notify)
+    [[ "$policy" == off ]] && return 0
+    [[ " $MDWATCH_NTFY_STATES " == *" $state "* || "$policy" == high ]] || return 0
+    local prio=3
     case "$state" in
-        FAILED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|CANCELLED) priority="high" ;;
-        STARTED) priority="min" ;;
-        *) priority="default" ;;
+        FAILED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|BOOT_FAIL|STALLED) prio=4 ;;
+        STARTED|SUBMITTED) prio=2 ;;
     esac
-    msg=$(python3 - "$event_file" <<'PY' 2>/dev/null || true
-import json, sys
-e = json.load(open(sys.argv[1]))
-print(f"job {e['jobid']} ({e['name']}) on {e['cluster']}: {e['state']} after {e.get('elapsed','?')}")
-PY
-)
-    [[ -z "$msg" ]] && msg="$(basename "$event_file")"
-    curl -s -m 10 -H "Title: $title" -H "Priority: $priority" -d "$msg" "$MDWATCH_NTFY_URL/$MDWATCH_NTFY_TOPIC" >/dev/null || true
+    [[ "$policy" == high && $prio -lt 4 ]] && prio=4
+    NOTIFY+=("$prio|$state|job $jobid ($name): $state${detail:+ $detail}")
 }
+
+# one push per poll: a single event keeps its own title, bursts are summarized
+flush_notify() {
+    (( ${#NOTIFY[@]} )) || return 0
+    local line prio=1 title body="" p state
+    for line in "${NOTIFY[@]}"; do
+        IFS='|' read -r p state _ <<< "$line"
+        (( p > prio )) && prio=$p
+        body+="${line#*|*|}"$'\n'
+    done
+    if (( ${#NOTIFY[@]} == 1 )); then
+        title="mdwatch: $state"
+    else
+        title="mdwatch: ${#NOTIFY[@]} job events"
+    fi
+    curl -s -m 10 -H "Title: $title" -H "Priority: $prio" --data-binary "${body%$'\n'}" \
+        "$MDWATCH_NTFY_URL/$MDWATCH_NTFY_TOPIC" >/dev/null || true
+    NOTIFY=()
+}
+
+fire() {
+    local file="$1" state="$2"
+    echo "event: $file"
+    run_hooks "$file" "$state"
+}
+
+queue_snapshot() {
+    local args
+    mapfile -t args < <(cluster_args)
+    squeue ${args[@]+"${args[@]}"} -u "$MDWATCH_USER" -h -o '%i|%T|%j|%N|%M|%l|%Z|%k' 2>/dev/null || true
+}
+
+# paths of a running job, cached per job: "stdout|stderr"
+job_paths() {
+    local jobid="$1" cache="$MDWATCH_STATE_DIR/jobs/$1"
+    if [[ ! -s "$cache" ]]; then
+        mkdir -p "$MDWATCH_STATE_DIR/jobs"
+        scontrol show job -o "$jobid" 2>/dev/null | tr ' ' '\n' \
+            | awk -F= '$1=="StdOut"{o=$2} $1=="StdErr"{e=$2} END{print o "|" e}' > "$cache"
+    fi
+    cat "$cache"
+}
+
+# true when any watched file changed within the last MIN minutes
+job_active() {
+    local jobid="$1" workdir="$2" minutes="$3" extra="$4" out err p
+    IFS='|' read -r out err < <(job_paths "$jobid")
+    for p in "$out" "$err" "$extra"; do
+        [[ -n "$p" && -e "$p" ]] || continue
+        [[ -n "$(find "$p" -maxdepth "$MDWATCH_STALL_DEPTH" -type f -mmin "-$minutes" -print -quit 2>/dev/null)" ]] && return 0
+    done
+    [[ -d "$workdir" ]] || return 0
+    [[ -n "$(find "$workdir" -maxdepth "$MDWATCH_STALL_DEPTH" -type f -mmin "-$minutes" -print -quit 2>/dev/null)" ]]
+}
+
+# known_jobs line: jobid|state|flags|epoch of last change|tags
+declare -A K_STATE=() K_FLAGS=() K_TIME=() K_TAGS=()
+
+load_known() {
+    local f="$MDWATCH_STATE_DIR/known_jobs" j s fl t tg
+    [[ -f "$f" ]] || return 0
+    while IFS='|' read -r j s fl t tg; do
+        if [[ -z "$s" && "$j" == *" "* ]]; then
+            s=${j#* }; j=${j%% *}
+            s=$(canonical_state "$s")
+            [[ "$s" == PENDING || "$s" == RUNNING ]] || is_terminal_event "$s" || s=RUNNING
+        fi
+        [[ -n "$j" && -n "$s" ]] || continue
+        [[ "$t" =~ ^[0-9]+$ ]] || t=$NOW
+        K_STATE[$j]=$s; K_FLAGS[$j]=$fl; K_TIME[$j]=$t; K_TAGS[$j]=$tg
+    done < "$f"
+}
+
+save_known() {
+    local f="$MDWATCH_STATE_DIR/known_jobs" j keep=$(( MDWATCH_KEEP_HOURS * 3600 ))
+    for j in "${!K_STATE[@]}"; do
+        (( NOW - ${K_TIME[$j]:-0} > keep )) && { unset "K_STATE[$j]"; rm -f "$MDWATCH_STATE_DIR/jobs/$j"; continue; }
+        printf '%s|%s|%s|%s|%s\n' "$j" "${K_STATE[$j]}" "${K_FLAGS[$j]:-}" "${K_TIME[$j]:-}" "${K_TAGS[$j]:-}"
+    done > "$f.tmp"
+    mv "$f.tmp" "$f"
+}
+
+has_flag() { [[ ",$1," == *",$2,"* ]]; }
+add_flag() { has_flag "$1" "$2" && printf '%s' "$1" || printf '%s' "${1:+$1,}$2"; }
+del_flag() { local s=",$1,"; s=${s//,$2,/,}; s=${s#,}; printf '%s' "${s%,}"; }
+
+check_running() {
+    local jobid="$1" name="$2" elapsed="$3" limit="$4" workdir="$5" node="$6"
+    local tags="${K_TAGS[$jobid]:-}" flags="${K_FLAGS[$jobid]:-}" e l pct
+    e=$(to_seconds "$elapsed"); l=$(to_seconds "$limit")
+    if (( l > 0 )) && ! has_flag "$flags" near; then
+        pct=$(( e * 100 / l ))
+        if (( pct >= MDWATCH_WALLTIME_WARN )); then
+            fire "$(emit_event "$jobid" "$name" NEAR_TIMEOUT node "$node" elapsed "$elapsed" timelimit "$limit" \
+                workdir "$workdir" tags "$tags")" NEAR_TIMEOUT
+            queue_notify "$jobid" "$name" NEAR_TIMEOUT "at $elapsed of $limit" "$tags"
+            flags=$(add_flag "$flags" near)
+        fi
+    fi
+    local stall
+    stall=$(tag_value "$tags" stall)
+    stall=${stall:-$MDWATCH_STALL_MINUTES}
+    if [[ "$stall" =~ ^[0-9]+$ ]] && (( stall > 0 && e > stall * 60 )); then
+        if job_active "$jobid" "$workdir" "$stall" "$(tag_value "$tags" watch)"; then
+            flags=$(del_flag "$flags" stall)
+        elif ! has_flag "$flags" stall; then
+            fire "$(emit_event "$jobid" "$name" STALLED node "$node" elapsed "$elapsed" timelimit "$limit" \
+                workdir "$workdir" idle_minutes "$stall" tags "$tags")" STALLED
+            queue_notify "$jobid" "$name" STALLED "on $node: no output for ${stall} min" "$tags"
+            flags=$(add_flag "$flags" stall)
+        fi
+    fi
+    K_FLAGS[$jobid]=$flags
+}
+
+# terminal records for finished jobs (array tasks included), with efficiency figures
+finish_jobs() {
+    local ids="$1" args
+    [[ -n "$ids" ]] || return 0
+    mapfile -t args < <(cluster_args)
+    declare -A rss=()
+    local j r base
+    while IFS='|' read -r j r; do
+        base=${j%%.*}
+        r=$(numfmt --from=iec "${r%B}" 2>/dev/null || echo 0)
+        (( r > ${rss[$base]:-0} )) && rss[$base]=$r
+    done < <(sacct ${args[@]+"${args[@]}"} -n --parsable2 -j "$ids" -o JobID,MaxRSS 2>/dev/null || true)
+
+    local jobid state name elapsed node exitcode workdir stdout stderr limit totalcpu ncpu reqmem comment
+    while IFS='|' read -r jobid state name elapsed node exitcode workdir stdout stderr limit totalcpu ncpu reqmem comment; do
+        [[ "$jobid" =~ ^[0-9]+(_[0-9]+)?$ ]] || continue
+        [[ -n "${SEEN[$jobid]:-}" ]] && continue
+        state=$(canonical_state "${state%% *}")
+        is_running_state "$state" && continue
+        is_terminal_event "${K_STATE[$jobid]:-}" && continue
+        local tags="${K_TAGS[$jobid]:-$(job_tags "$comment")}"
+        tag_set "$tags" off && continue
+        local e c cpu_eff="" time_used="" mem=""
+        e=$(to_seconds "$elapsed"); c=$(to_seconds "$totalcpu")
+        [[ "$ncpu" =~ ^[0-9]+$ ]] && (( e > 0 && ncpu > 0 )) && cpu_eff="$(( c * 100 / (e * ncpu) ))%"
+        (( $(to_seconds "$limit") > 0 )) && time_used="$(( e * 100 / $(to_seconds "$limit") ))%"
+        (( ${rss[$jobid]:-0} > 0 )) && mem=$(numfmt --to=iec "${rss[$jobid]}")
+        fire "$(emit_event "$jobid" "$name" "$state" exitcode "$exitcode" node "$node" elapsed "$elapsed" \
+            timelimit "$limit" time_used "$time_used" cpus "$ncpu" cpu_efficiency "$cpu_eff" \
+            max_rss "$mem" req_mem "$reqmem" workdir "$workdir" stdout "$stdout" stderr "$stderr" tags "$tags")" "$state"
+        queue_notify "$jobid" "$name" "$state" "after $elapsed${exitcode:+ (exit $exitcode)}" "$tags"
+        K_STATE[$jobid]=$state; K_TIME[$jobid]=$NOW; K_TAGS[$jobid]=$tags
+    done < <(sacct ${args[@]+"${args[@]}"} -X -n --parsable2 --expand-patterns -j "$ids" \
+        -o JobID,State,JobName,Elapsed,NodeList,ExitCode,WorkDir,StdOut,StdErr,Timelimit,TotalCPU,AllocCPUS,ReqMem,Comment 2>/dev/null || true)
+}
+
+declare -A SEEN=()
 
 cmd_watch() {
     load_config
     mkdir -p "$MDWATCH_STATE_DIR/events"
-    local lock="$MDWATCH_STATE_DIR/watch.lock"
-    exec 9>"$lock"
+    exec 9>"$MDWATCH_STATE_DIR/watch.lock"
     flock -n 9 || { echo "another watch is running"; exit 0; }
+    NOW=$(date +%s)
+    load_known
 
-    local state_file="$MDWATCH_STATE_DIR/known_jobs"
-    local -A known=()
-    if [[ -f "$state_file" ]]; then
-        while read -r j s; do
-            [[ -n "${j:-}" ]] && known["$j"]="$s"
-        done < "$state_file"
-    fi
+    local jobid state name node elapsed limit workdir comment
+    while IFS='|' read -r jobid state name node elapsed limit workdir comment; do
+        [[ -n "$jobid" && "$jobid" != *"["* ]] || continue
+        SEEN[$jobid]=1
+        local tags prev
+        tags=$(job_tags "$comment")
+        tag_set "$tags" off && continue
+        prev="${K_STATE[$jobid]:-}"
+        K_TAGS[$jobid]=$tags
+        case "$state" in
+            PENDING|CONFIGURING)
+                if [[ -z "$prev" ]]; then
+                    fire "$(emit_event "$jobid" "$name" SUBMITTED workdir "$workdir" timelimit "$limit" tags "$tags")" SUBMITTED
+                    queue_notify "$jobid" "$name" SUBMITTED "" "$tags"
+                elif [[ "$prev" == RUNNING ]]; then
+                    fire "$(emit_event "$jobid" "$name" REQUEUED workdir "$workdir" tags "$tags")" REQUEUED
+                    queue_notify "$jobid" "$name" REQUEUED "" "$tags"
+                    K_FLAGS[$jobid]=""
+                fi
+                state=PENDING
+                ;;
+            RUNNING|COMPLETING|SUSPENDED|STAGE_OUT|SIGNALING|RESIZING)
+                if [[ -z "$prev" || "$prev" == PENDING ]]; then
+                    fire "$(emit_event "$jobid" "$name" STARTED node "$node" timelimit "$limit" workdir "$workdir" tags "$tags")" STARTED
+                    queue_notify "$jobid" "$name" STARTED "on $node" "$tags"
+                fi
+                state=RUNNING
+                check_running "$jobid" "$name" "$elapsed" "$limit" "$workdir" "$node"
+                ;;
+        esac
+        K_STATE[$jobid]=$state
+        K_TIME[$jobid]=$NOW
+    done < <(queue_snapshot)
 
-    local snap running_ids=""
-    snap=$(queue_snapshot)
-    local -A seen=()
-    while IFS='|' read -r jobid state name nodelist elapsed; do
-        [[ -z "${jobid:-}" ]] && continue
-        seen["$jobid"]="$(canonical_state "$state")"
-        running_ids+="${running_ids:+,}${jobid%%.*}"
-        if [[ -z "${known[$jobid]:-}" ]]; then
-            local f
-            f=$(emit_event "${MDWATCH_CLUSTERS:-local}" "${jobid%%.*}" "$name" "STARTED" "\"state_raw\": \"${seen[$jobid]}\",\n  \"node\": \"${nodelist}\",\n  \"elapsed\": \"${elapsed}\"")
-            echo "event: $f"
-            run_hooks "$f"
-            ntfy_push "$f"
-        fi
-    done <<< "$snap"
-
-    # jobs known but no longer in the queue: get final state from accounting
-    local gone=""
-    for j in "${!known[@]}"; do
-        [[ -z "${seen[$j]:-}" ]] && gone+="${gone:+,}${j%%.*}"
+    local gone="" j
+    for j in "${!K_STATE[@]}"; do
+        [[ -z "${SEEN[$j]:-}" ]] && ! is_terminal_event "${K_STATE[$j]}" && gone+="${gone:+,}$j"
     done
-    # jobs that lived and died entirely between polls: query the accounting
-    # window since the last poll for terminal states never seen before
-    local last_poll_file="$MDWATCH_STATE_DIR/last_poll"
-    local since
+    # jobs that started and ended between two polls
+    local last_poll_file="$MDWATCH_STATE_DIR/last_poll" since args
     since=$(date -d '-10 min' +"%FT%T")
-    [[ -f "$last_poll_file" ]] && since=$(cat "$last_poll_file")
-    date +"%FT%T" > "$last_poll_file"
-    local dead_ids=""
-    while IFS='|' read -r jobid state name elapsed nodelist exitcode; do
-        [[ -z "${jobid:-}" ]] && continue
-        jobid="${jobid%%.*}"
-        [[ "$jobid" =~ ^[0-9]+$ ]] || continue
-        [[ -n "${seen[$jobid]:-}" || -n "${known[$jobid]:-}" ]] && continue
-        local cs
-        cs=$(canonical_state "$state")
-        is_running_state "$cs" && continue
-        dead_ids+="${dead_ids:+ }$jobid"
-    done < <(sacct -S "$since" -E now -u "$MDWATCH_USER" -X --parsable2 -o 'JobID,State,JobName,Elapsed,NodeList,ExitCode' 2>/dev/null || true)
-    gone+="${gone:+,}${dead_ids// /,}"
-    if [[ -n "$gone" ]]; then
-        local jobid name state exitcode elapsed nodelist workdir stdout stderr
-        while IFS='|' read -r jobid state name elapsed nodelist exitcode workdir stdout stderr; do
-            [[ -z "${jobid:-}" ]] && continue
-            jobid="${jobid%%.*}"
-            [[ "$jobid" =~ ^[0-9]+$ ]] || continue
-            [[ -n "${seen[$jobid]:-}" ]] && continue
-            if [[ -n "${known[$jobid]:-}" ]] && ! is_running_state "${known[$jobid]}"; then
-                continue
-            fi
-            state=$(canonical_state "$state")
-            is_running_state "$state" && continue
-            local f
-            f=$(emit_event "${MDWATCH_CLUSTERS:-local}" "$jobid" "$name" "$state" "\"exitcode\": \"${exitcode:-}\",\n  \"node\": \"${nodelist}\",\n  \"elapsed\": \"${elapsed}\",\n  \"workdir\": \"$(json_escape "${workdir:-}")\",\n  \"stdout\": \"$(json_escape "${stdout:-}")\",\n  \"stderr\": \"$(json_escape "${stderr:-}")\"\n")
-            echo "event: $f"
-            known[$jobid]="$state"
-            run_hooks "$f"
-            ntfy_push "$f"
-        done < <(final_states "$gone")
-    fi
+    [[ -s "$last_poll_file" ]] && since=$(cat "$last_poll_file")
+    date -d "@$NOW" +"%FT%T" > "$last_poll_file"
+    mapfile -t args < <(cluster_args)
+    while IFS='|' read -r j state; do
+        [[ "$j" =~ ^[0-9]+(_[0-9]+)?$ ]] || continue
+        [[ -n "${SEEN[$j]:-}" || -n "${K_STATE[$j]:-}" ]] && continue
+        is_running_state "${state%% *}" || gone+="${gone:+,}$j"
+    done < <(sacct ${args[@]+"${args[@]}"} -S "$since" -E now -u "$MDWATCH_USER" -X -n --parsable2 -o JobID,State 2>/dev/null || true)
+    finish_jobs "$gone"
 
-    # persist new known state: running jobs + terminal states (prune old)
-    {
-        for j in "${!seen[@]}"; do
-            echo "$j ${seen[$j]}"
-        done
-        for j in "${!known[@]}"; do
-            if [[ -n "${seen[$j]:-}" ]]; then
-                continue
-            fi
-            echo "$j ${known[$j]}"
-        done
-    } | awk '!seen[$1]++' > "$state_file.tmp"
-    mv "$state_file.tmp" "$state_file"
+    flush_notify
+    save_known
+    find "$MDWATCH_STATE_DIR/events" -name '*.json' -mtime "+$MDWATCH_EVENT_DAYS" -delete 2>/dev/null || true
+}
+
+event_files() {
+    find "$MDWATCH_STATE_DIR/events" -maxdepth 1 -name "*${1:-}*.json" 2>/dev/null | sort
 }
 
 cmd_events() {
     local n="${1:-10}"
-    ls -1v "$MDWATCH_STATE_DIR"/events/*.json 2>/dev/null | tail -n "$n" | while read -r f; do
+    event_files | tail -n "$n" | while read -r f; do
         python3 - "$f" <<'PY'
 import json, sys
 try:
     e = json.load(open(sys.argv[1]))
-    print(f"{e['timestamp']}  {e['state']:<14} {e['cluster']:<8} job {e['jobid']:<10} {e['name']}")
+    extra = e.get("elapsed", "")
+    if e.get("exitcode") not in (None, "", "0:0"):
+        extra += f" exit {e['exitcode']}"
+    print(f"{e['timestamp']}  {e['state']:<13} job {e['jobid']:<12} {e['name']:<24} {extra}")
 except Exception:
     print(sys.argv[1])
 PY
@@ -243,14 +421,9 @@ PY
 }
 
 cmd_show() {
-    local jobid="${1:?usage: mdwatch show JOBID [LINES]}" lines="${2:-40}"
-    local f
-    f=$(ls -1v "$MDWATCH_STATE_DIR"/events/*"${jobid}"_*.json 2>/dev/null | tail -n 1)
-    if [[ -n "$f" ]]; then
-        cat "$f"
-    else
-        echo "no mdwatch event for job $jobid"
-    fi
+    local jobid="${1:?usage: mdwatch show JOBID [LINES]}" lines="${2:-40}" f
+    f=$(event_files "_${jobid}_" | tail -n 1)
+    if [[ -n "$f" ]]; then cat "$f"; else echo "no mdwatch event for job $jobid"; fi
     local workdir stdout stderr
     IFS='|' read -r workdir stdout stderr < <(sacct -X -n --parsable2 --expand-patterns -j "$jobid" -o WorkDir,StdOut,StdErr 2>/dev/null | head -n 1)
     echo "workdir: ${workdir:-?}"
@@ -262,6 +435,45 @@ cmd_show() {
     done
 }
 
+# terminal event name for a job, from mdwatch events or directly from accounting
+terminal_state() {
+    local f s
+    for f in $(event_files "_${1}_" | tac); do
+        s=${f##*_}; s=${s%.json}
+        is_terminal_event "$s" && { echo "$s"; return; }
+    done
+    s=$(sacct -X -n --parsable2 -j "$1" -o State 2>/dev/null | head -n 1)
+    s=$(canonical_state "${s%% *}")
+    [[ -n "$s" ]] && ! is_running_state "$s" && echo "$s"
+    return 0
+}
+
+cmd_wait() {
+    local ids=() timeout=0
+    while (( $# )); do
+        case "$1" in
+            --timeout) timeout="$2"; shift 2 ;;
+            *) ids+=("${1%%.*}"); shift ;;
+        esac
+    done
+    (( ${#ids[@]} )) || { echo "usage: mdwatch wait JOBID... [--timeout SECONDS]" >&2; return 2; }
+    load_config
+    local start=$SECONDS id s rc=0
+    declare -A done_state=()
+    while :; do
+        for id in "${ids[@]}"; do
+            [[ -n "${done_state[$id]:-}" ]] && continue
+            s=$(terminal_state "$id")
+            [[ -n "$s" ]] || continue
+            done_state[$id]=$s
+            echo "$id $s"
+            [[ "$s" == FINISHED ]] || rc=1
+        done
+        (( ${#done_state[@]} == ${#ids[@]} )) && return "$rc"
+        (( timeout > 0 && SECONDS - start >= timeout )) && { echo "timeout after ${timeout}s" >&2; return 124; }
+        sleep 20
+    done
+}
 cmd_status() {
     load_config
     echo "mdwatch $VERSION"
@@ -323,25 +535,22 @@ cmd_install() {
     load_config
     mkdir -p "$MDWATCH_STATE_DIR/events" "$MDWATCH_HOOKS_DIR" "$(dirname "$MDWATCH_CONFIG")"
     if [[ ! -f "$MDWATCH_CONFIG" ]]; then
-        cat > "$MDWATCH_CONFIG" <<'EOF'
-# mdwatch configuration
-# MDWATCH_USER=roncoroni
-# MDWATCH_CLUSTERS=          # e.g. "etna" to use squeue -M; empty = local cluster
-# MDWATCH_NTFY_TOPIC=        # e.g. "mdwatch-roncoroni" to enable ntfy.sh pushes
+        cat > "$MDWATCH_CONFIG" <<'CFG'
+# mdwatch configuration (all optional)
+# MDWATCH_CLUSTERS=            # squeue/sacct -M value; empty = local cluster
+# MDWATCH_NTFY_TOPIC=          # ntfy topic for push notifications; pick an unguessable name
 # MDWATCH_NTFY_URL=https://ntfy.sh
-EOF
+# MDWATCH_NTFY_STATES="STARTED REQUEUED NEAR_TIMEOUT STALLED FINISHED FAILED TIMEOUT CANCELLED OUT_OF_MEMORY NODE_FAIL PREEMPTED BOOT_FAIL DEADLINE"
+# MDWATCH_WALLTIME_WARN=90     # NEAR_TIMEOUT at this percent of the time limit
+# MDWATCH_STALL_MINUTES=0      # STALLED after this many minutes without output; 0 = only jobs tagged stall=N
+# MDWATCH_KEEP_HOURS=48        # forget finished jobs after this long
+# MDWATCH_EVENT_DAYS=60        # delete event files older than this
+CFG
         echo "wrote $MDWATCH_CONFIG"
     fi
     if [[ ! -e "$MDWATCH_HOOKS_DIR/00-log-to-file.sh" ]]; then
-        cat > "$MDWATCH_HOOKS_DIR/00-log-to-file.sh" <<'EOF'
-#!/usr/bin/env bash
-# example hook: append a one-line summary of every event
-event=$(cat) || exit 0
-summary=$(printf '%s' "$event" | tr -d '\n' | tr -s ' ')
-echo "$(date -u +%FT%T) $summary" >> "${MDWATCH_STATE_DIR:-$HOME/.local/state/mdwatch}/hooks.log"
-EOF
-        chmod +x "$MDWATCH_HOOKS_DIR/00-log-to-file.sh"
-        echo "wrote $MDWATCH_HOOKS_DIR/00-log-to-file.sh"
+        install -m 755 "$(dirname "$(readlink -f "$0")")/../examples/log-to-file.sh" "$MDWATCH_HOOKS_DIR/00-log-to-file.sh" \
+            && echo "wrote $MDWATCH_HOOKS_DIR/00-log-to-file.sh"
     fi
     mkdir -p "$HOME/.local/bin"
     ln -sfn "$(readlink -f "$0")" "$HOME/.local/bin/mdwatch" && echo "linked $HOME/.local/bin/mdwatch"
@@ -383,6 +592,7 @@ case "${1:-}" in
     watch)   shift; cmd_watch "$@" ;;
     events)  shift; cmd_events "$@" ;;
     show)    shift; cmd_show "$@" ;;
+    wait)    shift; cmd_wait "$@" ;;
     status)  shift; cmd_status "$@" ;;
     install) shift; cmd_install "$@" ;;
     daemon)  shift; cmd_daemon "$@" ;;

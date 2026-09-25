@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # example hook: push mdwatch events to an ntfy.sh topic
 #
-# Enable by setting MDWATCH_NTFY_TOPIC in the config, or copy this hook into
-# ~/.config/mdwatch/hooks.d/ and edit the topic below.
+# The built-in push (MDWATCH_NTFY_TOPIC) covers most needs; use this hook for
+# custom formatting. Copy it into ~/.config/mdwatch/hooks.d/ and set the topic.
+# mdwatch-states: FAILED TIMEOUT OUT_OF_MEMORY NODE_FAIL STALLED FINISHED
 
 event=$(cat) || true
-topic="${MDWATCH_NTFY_TOPIC:-mdwatch-$(id -un)}"
+topic="${MDWATCH_NTFY_TOPIC:?set MDWATCH_NTFY_TOPIC to an unguessable topic}"
 
 state=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' <<< "$event" 2>/dev/null) || exit 0
 jobid=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["jobid"])' <<< "$event" 2>/dev/null)
@@ -22,4 +23,4 @@ curl -s -m 10 \
     -H "Priority: $priority" \
     -H "Tags: $([ "$state" = FINISHED ] && echo white_check_mark || echo warning)" \
     -d "job $jobid ($name): $state" \
-    "https://ntfy.sh/$topic" >/dev/null
+    "${MDWATCH_NTFY_URL:-https://ntfy.sh}/$topic" >/dev/null

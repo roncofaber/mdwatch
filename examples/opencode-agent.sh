@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # mdwatch hook: fire a headless opencode agent turn on job failures.
+# mdwatch-states: FAILED TIMEOUT OUT_OF_MEMORY NODE_FAIL BOOT_FAIL STALLED
 #
 # The agent investigates the failure autonomously (no human message needed).
 # Runs detached so the 30 s hook timeout does not apply; logs to
@@ -8,14 +9,15 @@
 # The DIAGNOSIS line is pushed to ntfy when MDWATCH_NTFY_TOPIC is set.
 #
 # Guards:
-# - reacts to FAILED/TIMEOUT/OUT_OF_MEMORY/NODE_FAIL only (override with
-#   MDWATCH_AGENT_STATES, space separated)
+# - mdwatch only delivers the states on the mdwatch-states line above; edit it
+#   to react to more (e.g. FINISHED for completion summaries)
+# - skipped for jobs submitted with --comment=mdwatch:agent=off
 # - once per jobid (agent_handled marker prevents reaction loops)
 # - runs a dedicated read-only "mdwatch" agent: reads anywhere, runs only
 #   inspection commands, cannot edit files, submit, cancel or fetch the web
 #
 # Config (config.env):
-#   MDWATCH_AGENT_MODEL   provider/model (default cborg/lbl/cborg-coder-max)
+#   MDWATCH_AGENT_MODEL   opencode provider/model; default: opencode's configured model
 #   MDWATCH_AGENT_ENV     file sourced for API keys (default ~/.secrets.env);
 #                         systemd timers and cron do not load shell profiles
 
@@ -28,7 +30,7 @@ field() {
 }
 
 state=$(field state) || exit 0
-[[ " ${MDWATCH_AGENT_STATES:-FAILED TIMEOUT OUT_OF_MEMORY NODE_FAIL} " == *" $state "* ]] || exit 0
+[[ " $(field tags) " == *" agent=off "* ]] && exit 0
 jobid=$(field jobid)
 name=$(field name)
 workdir=$(field workdir)
@@ -51,7 +53,8 @@ source "${MDWATCH_AGENT_ENV:-$HOME/.secrets.env}" 2>/dev/null || true
 export MDWATCH_NTFY_TOPIC MDWATCH_NTFY_URL
 PATH="$HOME/.local/bin:$(dirname "$(readlink -f "$0")"):$PATH"
 export PATH
-model="${MDWATCH_AGENT_MODEL:-cborg/lbl/cborg-coder-max}"
+model_args=()
+[[ -n "${MDWATCH_AGENT_MODEL:-}" ]] && model_args=(-m "$MDWATCH_AGENT_MODEL")
 [[ -d "$workdir" ]] || workdir="${MDWATCH_AGENT_WORKDIR:-$HOME}"
 logfile="$log_dir/$(date -u +%FT%H%M)Z_${jobid}_$state.log"
 
@@ -87,7 +90,7 @@ export OPENCODE_CONFIG_CONTENT='{
   }
 }'
 
-prompt="mdwatch event: SLURM job $jobid ('$name') ended with state $state. "
+prompt="mdwatch event: SLURM job $jobid ('$name') reported state $state. "
 prompt+="Working directory: $workdir. Stdout: ${stdout:-unknown}. Stderr: ${stderr:-unknown}. "
 prompt+="Event JSON: $(tr -d '\n' <<< "$event"). "
 prompt+="Read the job output and the relevant inputs/logs in the working directory "
@@ -99,12 +102,14 @@ prompt+="one line starting 'DIAGNOSIS:' that states the cause and the suggested 
 
 printf '%s\n' "$event" > "$logfile"
 setsid nohup bash -c '
+    opencode="$1" prompt="$2" log="$3" jobid="$5"
     cd "$4" || exit 1
-    timeout 900 "$1" run --agent mdwatch -m "$5" "$2"
-    grep -aq "DIAGNOSIS:" "$3" || printf "DIAGNOSIS: no explicit diagnosis; the turn ended early (see log above).\n" >> "$3"
+    shift 5
+    timeout 900 "$opencode" run --agent mdwatch "$@" "$prompt"
+    grep -aq "DIAGNOSIS:" "$log" || printf "DIAGNOSIS: no explicit diagnosis; the turn ended early (see log above).\n" >> "$log"
     if [[ -n "${MDWATCH_NTFY_TOPIC:-}" ]]; then
-        diag=$(grep -a "DIAGNOSIS:" "$3" | tail -n 1 | sed "s/\x1b\[[0-9;]*m//g")
-        curl -s -m 10 -H "Title: mdwatch agent: job $6" -H "Tags: mag" -d "$diag" \
+        diag=$(grep -a "DIAGNOSIS:" "$log" | tail -n 1 | sed "s/\x1b\[[0-9;]*m//g")
+        curl -s -m 10 -H "Title: mdwatch agent: job $jobid" -H "Tags: mag" -d "$diag" \
             "${MDWATCH_NTFY_URL:-https://ntfy.sh}/$MDWATCH_NTFY_TOPIC" >/dev/null || true
     fi
-' _ "$opencode_bin" "$prompt" "$logfile" "$workdir" "$model" "$jobid" >> "$logfile" 2>&1 < /dev/null &
+' _ "$opencode_bin" "$prompt" "$logfile" "$workdir" "$jobid" ${model_args[@]+"${model_args[@]}"} >> "$logfile" 2>&1 < /dev/null 9>&- &
