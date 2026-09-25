@@ -132,5 +132,29 @@ echo "1100|RUNNING|old|n1|1:00|1:00:00|$T/w|(null)" > "$FAKE_DIR/squeue.txt"
 watch
 check "old state format migrates silently" "$(events)" ""
 
+# agent hook: runs are serialized, siblings see related failures, covered jobs are skipped
+setup
+mkdir -p "$MDWATCH_STATE_DIR/events" "$T/w"
+cat > "$T/bin/opencode" <<'O'
+#!/usr/bin/env bash
+if ! mkdir "$FAKE_DIR/agent.running" 2>/dev/null; then echo overlap >> "$FAKE_DIR/agent.overlap"; fi
+prompt="${@: -1}"
+sleep 1
+ids=$(grep -oE '[0-9]+ FAILED' <<< "$prompt" | cut -d' ' -f1 | tr '\n' ' ')
+echo "DIAGNOSIS: shared cause for $ids"
+rmdir "$FAKE_DIR/agent.running"
+O
+chmod +x "$T/bin/opencode"
+for j in 1201 1202 1203; do
+    touch "$MDWATCH_STATE_DIR/events/2026-01-01T000000Z_${j}_FAILED.json"
+done
+for j in 1201 1202 1203; do
+    printf '{"state":"FAILED","jobid":"%s","name":"n","workdir":"%s","tags":""}' "$j" "$T/w" \
+        | OPENCODE_BIN="$T/bin/opencode" MDWATCH_AGENT_ENV=/dev/null "$here/../examples/opencode-agent.sh"
+done
+for _ in $(seq 20); do [[ $(grep -l DIAGNOSIS "$MDWATCH_STATE_DIR"/agent_logs/*.log 2>/dev/null | wc -l) -ge 3 ]] && break; sleep 1; done
+check "agent runs never overlap" "$(cat "$FAKE_DIR/agent.overlap" 2>/dev/null)" ""
+check "one real agent run, two covered" "$(cat "$MDWATCH_STATE_DIR"/agent_logs/*.log | grep -c "covered by")" "2"
+
 echo "$pass passed, $fail failed"
 (( fail == 0 ))

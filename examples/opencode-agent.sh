@@ -12,6 +12,10 @@
 # - mdwatch only delivers the states on the mdwatch-states line above; edit it
 #   to react to more (e.g. FINISHED for completion summaries)
 # - skipped for jobs submitted with --comment=mdwatch:agent=off
+# - one agent at a time (flock): parallel opencode runs share one SQLite
+#   database, which fails on NFS home directories. Failures that arrive while
+#   an agent is running are handed to it as related events, and a failure
+#   already covered by a recent diagnosis of a sibling job is skipped.
 # - once per jobid (agent_handled marker prevents reaction loops)
 # - runs a dedicated read-only "mdwatch" agent: reads anywhere, runs only
 #   inspection commands, cannot edit files, submit, cancel or fetch the web
@@ -90,9 +94,14 @@ export OPENCODE_CONFIG_CONTENT='{
   }
 }'
 
+related=$(find "$state_dir/events" -maxdepth 1 -name '*.json' -mmin -10 2>/dev/null \
+    | grep -E '_(FAILED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|BOOT_FAIL|STALLED)\.json$' \
+    | grep -v "_${jobid}_" | sed -E 's|.*/[0-9T-]+Z_([0-9]+(_[0-9]+)?)_([A-Z_]+)\.json$|\1 \3|' | sort -u | head -n 20 | tr '\n' ',' | sed 's/,$//')
+
 prompt="mdwatch event: SLURM job $jobid ('$name') reported state $state. "
 prompt+="Working directory: $workdir. Stdout: ${stdout:-unknown}. Stderr: ${stderr:-unknown}. "
 prompt+="Event JSON: $(tr -d '\n' <<< "$event"). "
+[[ -n "$related" ]] && prompt+="Other jobs that failed in the last 10 minutes: $related. If they share this cause, say so and name them in the diagnosis instead of treating this job in isolation. "
 prompt+="Read the job output and the relevant inputs/logs in the working directory "
 prompt+="(mdwatch show $jobid prints the event and output tails), and diagnose the likely "
 prompt+="cause (input error, missing file, timeout, memory, node failure). You are read-only: "
@@ -102,9 +111,16 @@ prompt+="one line starting 'DIAGNOSIS:' that states the cause and the suggested 
 
 printf '%s\n' "$event" > "$logfile"
 setsid nohup bash -c '
-    opencode="$1" prompt="$2" log="$3" jobid="$5"
+    opencode="$1" prompt="$2" log="$3" jobid="$5" lock="$6"
     cd "$4" || exit 1
-    shift 5
+    shift 6
+    exec 8>"$lock"
+    flock -w 3600 8 || { echo "DIAGNOSIS: skipped; another mdwatch agent held the lock for an hour." >> "$log"; exit 0; }
+    covered=$(grep -l -a "DIAGNOSIS:.*$jobid" "$(dirname "$log")"/*.log 2>/dev/null | grep -v "$log" | head -n 1)
+    if [[ -n "$covered" ]]; then
+        echo "DIAGNOSIS: covered by $(basename "$covered"): $(grep -a "DIAGNOSIS:" "$covered" | tail -n 1 | sed "s/^.*DIAGNOSIS: *//")" >> "$log"
+        exit 0
+    fi
     timeout 900 "$opencode" run --agent mdwatch "$@" "$prompt"
     grep -aq "DIAGNOSIS:" "$log" || printf "DIAGNOSIS: no explicit diagnosis; the turn ended early (see log above).\n" >> "$log"
     if [[ -n "${MDWATCH_NTFY_TOPIC:-}" ]]; then
@@ -112,4 +128,4 @@ setsid nohup bash -c '
         curl -s -m 10 -H "Title: mdwatch agent: job $jobid" -H "Tags: mag" -d "$diag" \
             "${MDWATCH_NTFY_URL:-https://ntfy.sh}/$MDWATCH_NTFY_TOPIC" >/dev/null || true
     fi
-' _ "$opencode_bin" "$prompt" "$logfile" "$workdir" "$jobid" ${model_args[@]+"${model_args[@]}"} >> "$logfile" 2>&1 < /dev/null 9>&- &
+' _ "$opencode_bin" "$prompt" "$logfile" "$workdir" "$jobid" "$state_dir/agent.lock" ${model_args[@]+"${model_args[@]}"} >> "$logfile" 2>&1 < /dev/null 9>&- &

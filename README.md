@@ -93,7 +93,7 @@ Examples in `examples/`:
 
 - `log-to-file.sh`: one line per event in `hooks.log` (installed by default).
 - `ntfy.sh`: standalone ntfy push, if you want different formatting from the built-in one.
-- `opencode-agent.sh`: starts a headless [opencode](https://opencode.ai) agent that diagnoses failed or stalled jobs. It runs read-only in the job's workdir (it can read files and run `sacct`, `squeue` and `mdwatch show`, but cannot edit, submit or cancel), writes its log to `~/.local/state/mdwatch/agent_logs/`, and pushes its final `DIAGNOSIS:` line to ntfy. Timers and cron do not load your shell profile, so it sources `MDWATCH_AGENT_ENV` (default `~/.secrets.env`) for API keys; set the model with `MDWATCH_AGENT_MODEL`.
+- `opencode-agent.sh`: starts a headless [opencode](https://opencode.ai) agent that diagnoses failed or stalled jobs. It runs read-only in the job's workdir (it can read files and run `sacct`, `squeue` and `mdwatch show`, but cannot edit, submit or cancel), writes its log to `~/.local/state/mdwatch/agent_logs/`, and pushes its final `DIAGNOSIS:` line to ntfy. Agents run one at a time (opencode keeps its sessions in one SQLite database, which breaks under concurrent writers on NFS homes); each agent is told about other jobs that failed in the last 10 minutes, and a job already named in a sibling's diagnosis is skipped, so a batch of chains failing for one reason produces one diagnosis. Timers and cron do not load your shell profile, so it sources `MDWATCH_AGENT_ENV` (default `~/.secrets.env`) for API keys; set the model with `MDWATCH_AGENT_MODEL`.
 
 ## Configuration
 
