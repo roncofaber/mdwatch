@@ -19,6 +19,7 @@
 #   MDWATCH_AGENT_ENV     file sourced for API keys (default ~/.secrets.env);
 #                         systemd timers and cron do not load shell profiles
 
+# shellcheck disable=SC1090
 source "${MDWATCH_CONFIG:-$HOME/.config/mdwatch/config.env}" 2>/dev/null || true
 event=$(cat) || true
 
@@ -48,7 +49,8 @@ opencode_bin="${OPENCODE_BIN:-$HOME/.opencode/bin/opencode}"
 # shellcheck disable=SC1090
 source "${MDWATCH_AGENT_ENV:-$HOME/.secrets.env}" 2>/dev/null || true
 export MDWATCH_NTFY_TOPIC MDWATCH_NTFY_URL
-export PATH="$HOME/.local/bin:$(dirname "$(readlink -f "$0")"):$PATH"
+PATH="$HOME/.local/bin:$(dirname "$(readlink -f "$0")"):$PATH"
+export PATH
 model="${MDWATCH_AGENT_MODEL:-cborg/lbl/cborg-coder-max}"
 [[ -d "$workdir" ]] || workdir="${MDWATCH_AGENT_WORKDIR:-$HOME}"
 logfile="$log_dir/$(date -u +%FT%H%M)Z_${jobid}_$state.log"
