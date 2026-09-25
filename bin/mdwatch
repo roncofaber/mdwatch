@@ -7,8 +7,9 @@
 # on stdin. An optional ntfy.sh push is built in.
 #
 # Usage:
-#   mdwatch watch                 one poll pass (cron runs this)
+#   mdwatch watch                 one poll pass (cron or the systemd timer runs this)
 #   mdwatch events [N]            show the last N events
+#   mdwatch show JOBID [LINES]    event JSON, workdir and tails of the job's stdout/stderr
 #   mdwatch status                show watcher configuration
 #   mdwatch install               create dirs, config, hooks, cron or systemd timer
 #   mdwatch daemon                foreground poll loop (last-resort scheduler)
@@ -17,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.1"
+VERSION="0.2.0"
 
 MDWATCH_STATE_DIR="${MDWATCH_STATE_DIR:-$HOME/.local/state/mdwatch}"
 MDWATCH_CONFIG="${MDWATCH_CONFIG:-$HOME/.config/mdwatch/config.env}"
@@ -25,7 +26,7 @@ MDWATCH_HOOKS_DIR="${MDWATCH_HOOKS_DIR:-$HOME/.config/mdwatch/hooks.d}"
 MDWATCH_HOOK_TIMEOUT="${MDWATCH_HOOK_TIMEOUT:-30}"
 
 usage() {
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
 }
 
 load_config() {
@@ -49,11 +50,11 @@ queue_snapshot() {
     squeue "${args[@]}" 2>/dev/null || true
 }
 
-# final state for job ids that left the queue; prints "jobid|state|name|elapsed|nodelist|exitcode"
+# final state for job ids that left the queue; prints "jobid|state|name|elapsed|nodelist|exitcode|workdir|stdout|stderr"
 final_states() {
     local ids="$1"
     [[ -z "$ids" ]] && return 0
-    local args=(-X --parsable2 -j "$ids" -o 'JobID,State,JobName,Elapsed,NodeList,ExitCode')
+    local args=(-X --parsable2 --expand-patterns -j "$ids" -o 'JobID,State,JobName,Elapsed,NodeList,ExitCode,WorkDir,StdOut,StdErr')
     [[ -n "$MDWATCH_CLUSTERS" ]] && args=(-M "$MDWATCH_CLUSTERS" "${args[@]}")
     sacct "${args[@]}" 2>/dev/null || true
 }
@@ -81,6 +82,12 @@ is_running_state() {
     esac
 }
 
+json_escape() {
+    local s="${1//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
 emit_event() {
     local cluster="$1" jobid="$2" name="$3" state="$4" extra="$5"
     local ts
@@ -91,7 +98,7 @@ emit_event() {
         printf '  "timestamp": "%s",\n' "$ts"
         printf '  "cluster": "%s",\n' "$cluster"
         printf '  "jobid": "%s",\n' "$jobid"
-        printf '  "name": "%s",\n' "$name"
+        printf '  "name": "%s",\n' "$(json_escape "$name")"
         printf '  "state": "%s",\n' "$state"
         printf '%b' "$extra"
         printf '}\n'
@@ -169,7 +176,8 @@ cmd_watch() {
     # jobs that lived and died entirely between polls: query the accounting
     # window since the last poll for terminal states never seen before
     local last_poll_file="$MDWATCH_STATE_DIR/last_poll"
-    local since="1970-01-01T00:00:00"
+    local since
+    since=$(date -d '-10 min' +"%FT%T")
     [[ -f "$last_poll_file" ]] && since=$(cat "$last_poll_file")
     date +"%FT%T" > "$last_poll_file"
     local dead_ids=""
@@ -185,8 +193,8 @@ cmd_watch() {
     done < <(sacct -S "$since" -E now -u "$MDWATCH_USER" -X --parsable2 -o 'JobID,State,JobName,Elapsed,NodeList,ExitCode' 2>/dev/null || true)
     gone+="${gone:+,}${dead_ids// /,}"
     if [[ -n "$gone" ]]; then
-        local row jobid name state exitcode elapsed nodelist
-        while IFS='|' read -r jobid state name elapsed nodelist exitcode; do
+        local jobid name state exitcode elapsed nodelist workdir stdout stderr
+        while IFS='|' read -r jobid state name elapsed nodelist exitcode workdir stdout stderr; do
             [[ -z "${jobid:-}" ]] && continue
             jobid="${jobid%%.*}"
             [[ "$jobid" =~ ^[0-9]+$ ]] || continue
@@ -197,7 +205,7 @@ cmd_watch() {
             state=$(canonical_state "$state")
             is_running_state "$state" && continue
             local f
-            f=$(emit_event "${MDWATCH_CLUSTERS:-local}" "$jobid" "$name" "$state" "\"exitcode\": \"${exitcode:-}\",\n  \"node\": \"${nodelist}\",\n  \"elapsed\": \"${elapsed}\"\n")
+            f=$(emit_event "${MDWATCH_CLUSTERS:-local}" "$jobid" "$name" "$state" "\"exitcode\": \"${exitcode:-}\",\n  \"node\": \"${nodelist}\",\n  \"elapsed\": \"${elapsed}\",\n  \"workdir\": \"$(json_escape "${workdir:-}")\",\n  \"stdout\": \"$(json_escape "${stdout:-}")\",\n  \"stderr\": \"$(json_escape "${stderr:-}")\"\n")
             echo "event: $f"
             known[$jobid]="$state"
             run_hooks "$f"
@@ -234,6 +242,26 @@ PY
     done
 }
 
+cmd_show() {
+    local jobid="${1:?usage: mdwatch show JOBID [LINES]}" lines="${2:-40}"
+    local f
+    f=$(ls -1v "$MDWATCH_STATE_DIR"/events/*"${jobid}"_*.json 2>/dev/null | tail -n 1)
+    if [[ -n "$f" ]]; then
+        cat "$f"
+    else
+        echo "no mdwatch event for job $jobid"
+    fi
+    local workdir stdout stderr
+    IFS='|' read -r workdir stdout stderr < <(sacct -X -n --parsable2 --expand-patterns -j "$jobid" -o WorkDir,StdOut,StdErr 2>/dev/null | head -n 1)
+    echo "workdir: ${workdir:-?}"
+    local out
+    for out in "$stdout" "$stderr"; do
+        [[ -n "$out" && -f "$out" ]] || continue
+        echo "--- tail -n $lines $out"
+        tail -n "$lines" "$out"
+    done
+}
+
 cmd_status() {
     load_config
     echo "mdwatch $VERSION"
@@ -242,10 +270,12 @@ cmd_status() {
     echo "  ntfy topic:  ${MDWATCH_NTFY_TOPIC:-disabled}"
     echo "  state dir:   $MDWATCH_STATE_DIR"
     echo "  hooks dir:   $MDWATCH_HOOKS_DIR ($(find "$MDWATCH_HOOKS_DIR" -maxdepth 1 -type f -executable 2>/dev/null | wc -l) active)"
-    if crontab -l 2>/dev/null | grep -q '# MDWATCH'; then
-        echo "  cron:        installed"
+    local mech
+    mech=$(active_mechanism)
+    if [[ "$mech" == none ]]; then
+        echo "  scheduler:   none (run: mdwatch install)"
     else
-        echo "  scheduler:   $(active_mechanism) (install: mdwatch install)"
+        echo "  scheduler:   $mech"
     fi
 }
 
@@ -313,6 +343,8 @@ EOF
         chmod +x "$MDWATCH_HOOKS_DIR/00-log-to-file.sh"
         echo "wrote $MDWATCH_HOOKS_DIR/00-log-to-file.sh"
     fi
+    mkdir -p "$HOME/.local/bin"
+    ln -sfn "$(readlink -f "$0")" "$HOME/.local/bin/mdwatch" && echo "linked $HOME/.local/bin/mdwatch"
     local cron_line
     cron_line="* * * * * $(readlink -f "$0") watch # MDWATCH"
     if crontab -l 2>/dev/null | grep -q '# MDWATCH'; then
@@ -350,6 +382,7 @@ cmd_remove() {
 case "${1:-}" in
     watch)   shift; cmd_watch "$@" ;;
     events)  shift; cmd_events "$@" ;;
+    show)    shift; cmd_show "$@" ;;
     status)  shift; cmd_status "$@" ;;
     install) shift; cmd_install "$@" ;;
     daemon)  shift; cmd_daemon "$@" ;;
