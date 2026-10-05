@@ -2,7 +2,7 @@
 
 Job event watcher for SLURM. It polls your jobs once a minute, writes one JSON file per state change, runs your hook scripts on each event, and can push notifications to your phone through [ntfy](https://ntfy.sh). It works for any kind of job, needs no root access and no daemon, and depends only on bash, the SLURM client tools, python3 and coreutils.
 
-Agents and scripts can ask "what happened?" (`mdwatch events`) or block until a job ends (`mdwatch wait`) instead of polling `squeue` in a loop.
+Agents and scripts can ask "what happened?" (`mdwatch events`) or block until a job ends (`mdwatch wait`) instead of polling `squeue` in a loop. Agents should run `mdwatch wait` as a background command, since a foreground wait outlives most tool timeouts.
 
 ## Install
 

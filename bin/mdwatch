@@ -421,11 +421,13 @@ PY
 }
 
 cmd_show() {
-    local jobid="${1:?usage: mdwatch show JOBID [LINES]}" lines="${2:-40}" f
+    local jobid="${1:?usage: mdwatch show JOBID [LINES]}" lines="${2:-40}" f args
+    load_config
+    mapfile -t args < <(cluster_args)
     f=$(event_files "_${jobid}_" | tail -n 1)
     if [[ -n "$f" ]]; then cat "$f"; else echo "no mdwatch event for job $jobid"; fi
     local workdir stdout stderr
-    IFS='|' read -r workdir stdout stderr < <(sacct -X -n --parsable2 --expand-patterns -j "$jobid" -o WorkDir,StdOut,StdErr 2>/dev/null | head -n 1)
+    IFS='|' read -r workdir stdout stderr < <(sacct ${args[@]+"${args[@]}"} -X -n --parsable2 --expand-patterns -j "$jobid" -o WorkDir,StdOut,StdErr 2>/dev/null | head -n 1)
     echo "workdir: ${workdir:-?}"
     local out
     for out in "$stdout" "$stderr"; do
@@ -437,12 +439,13 @@ cmd_show() {
 
 # terminal event name for a job, from mdwatch events or directly from accounting
 terminal_state() {
-    local f s
+    local f s args
+    mapfile -t args < <(cluster_args)
     for f in $(event_files "_${1}_" | tac); do
         s=${f##*_}; s=${s%.json}
         is_terminal_event "$s" && { echo "$s"; return; }
     done
-    s=$(sacct -X -n --parsable2 -j "$1" -o State 2>/dev/null | head -n 1)
+    s=$(sacct ${args[@]+"${args[@]}"} -X -n --parsable2 -j "$1" -o State 2>/dev/null | head -n 1)
     s=$(canonical_state "${s%% *}")
     [[ -n "$s" ]] && ! is_running_state "$s" && echo "$s"
     return 0

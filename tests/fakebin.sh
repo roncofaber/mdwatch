@@ -12,6 +12,7 @@ cat "$FAKE_DIR/squeue.txt" 2>/dev/null
 SH
     cat > "$bin/sacct" <<'SH'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_DIR/sacct.log"
 args=" $* "
 ids=""; prev=""
 for a in "$@"; do [[ "$prev" == -j ]] && ids="$a"; prev="$a"; done

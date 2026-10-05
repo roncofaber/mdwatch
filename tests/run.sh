@@ -118,6 +118,17 @@ echo "950|FAILED|w|00:00:01|n1|1:0|$T/w|||00:10:00|0:01|1|1G|" > "$FAKE_DIR/sacc
 out=$("$MDWATCH" wait 950 --timeout 5); rc=$?
 check "wait reports failure" "$out rc=$rc" "950 FAILED rc=1"
 
+# show and wait honour config.env (state dir, clusters)
+setup
+alt="$T/altstate"
+printf 'MDWATCH_STATE_DIR=%s\nMDWATCH_CLUSTERS=lr\n' "$alt" > "$MDWATCH_CONFIG"
+unset MDWATCH_STATE_DIR
+mkdir -p "$alt/events"; echo '{"state":"FAILED"}' > "$alt/events/2026-01-01T000000Z_960_FAILED.json"
+check "show reads the configured state dir" "$("$MDWATCH" show 960 | head -n 1)" '{"state":"FAILED"}'
+echo "961|FINISHED|w|00:00:01|n1|0:0|$T/w|||00:10:00|0:01|1|1G|" > "$FAKE_DIR/sacct.txt"
+"$MDWATCH" wait 961 --timeout 5 >/dev/null
+check "show and wait pass -M to sacct" "$(grep -vc -- '-M lr' "$FAKE_DIR/sacct.log")" "0"
+
 # finished jobs are forgotten after MDWATCH_KEEP_HOURS
 setup
 echo "MDWATCH_KEEP_HOURS=0" > "$MDWATCH_CONFIG"
