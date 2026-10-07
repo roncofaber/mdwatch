@@ -118,6 +118,17 @@ echo "950|FAILED|w|00:00:01|n1|1:0|$T/w|||00:10:00|0:01|1|1G|" > "$FAKE_DIR/sacc
 out=$("$MDWATCH" wait 950 --timeout 5); rc=$?
 check "wait reports failure" "$out rc=$rc" "950 FAILED rc=1"
 
+# wait survives a transient sacct failure instead of dying silently
+setup
+cat > "$T/bin/sacct" <<'SH'
+#!/usr/bin/env bash
+echo "sacct: error: slurm_persist_conn_open: failed" >&2
+exit 1
+SH
+chmod +x "$T/bin/sacct"
+"$MDWATCH" wait 970 --timeout 2 >/dev/null 2>&1; rc=$?
+check "wait keeps waiting through sacct errors" "rc=$rc" "rc=124"
+
 # show and wait honour config.env (state dir, clusters)
 setup
 alt="$T/altstate"
